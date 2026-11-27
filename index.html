@@ -221,7 +221,10 @@
          in every direction with no clamp, zooms on pinch, spins on a
          two-finger twist, resets on double-tap, and floats gently. Studio
          lighting plus a soft shadow on the floor beneath it. The transparent
-         PNG (.hp-fallback) only shows if WebGL is unavailable. --- */
+         PNG (.hp-fallback) is the first paint: it is on screen from the very
+         first frame, and the live model only crossfades in over it once it
+         has fully rendered (see the handoff at the end of the 3D script).
+         If the library or WebGL is unavailable, the PNG simply stays. --- */
       .hero-side{ min-width:0; }
       .hero-photo{ margin:0 0 10px; }
       .hp-view{
@@ -234,11 +237,17 @@
       }
       .hp-view:active{ cursor:grabbing; }
       .hp-stage{ position:absolute; inset:0; }
-      .hp-stage canvas{ display:block; width:100%; height:100%; touch-action:none; }
+      .hp-stage canvas{ display:block; width:100%; height:100%; touch-action:none; opacity:0; transition:opacity .7s ease; }
       .hp-view img.hp-fallback{
         display:block; width:86%; height:auto; pointer-events:none;
         animation:pg-float 7s ease-in-out infinite;
+        transition:opacity .7s ease;
       }
+      /* live handoff: once the 3D model is fully rendered, .hp-live
+         crossfades the canvas in over the photo and the photo out —
+         no instant swap, no jump */
+      .hp-view.hp-live .hp-stage canvas{ opacity:1; }
+      .hp-view.hp-live img.hp-fallback{ opacity:0; }
       /* the float animates the independent `translate` property, so it composes
          with (never fights) any JS-driven `transform` on the same img */
       @keyframes pg-float{ 0%,100%{ translate:0 0; } 50%{ translate:0 -9px; } }
@@ -653,6 +662,7 @@
         .live-dot{ animation:none; }
         body::before{ animation:none; }
         .hp-view img{ animation:none; }
+        .hp-stage canvas, .hp-view img.hp-fallback{ transition:none; }
         .ticker-track{ animation:none; }
         .toast{ animation:none; }
         .ask-typing i{ animation:none; }
@@ -2393,11 +2403,20 @@
         var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
         /* three.min.js loads async (never blocks the page); start once it
-           arrives — until then, and if it never does, the PNG stays */
+           arrives AND the IBM Plex Mono webfont is ready — the lens HUD is
+           drawn to a canvas texture once, so starting before the font lands
+           would bake the wrong typeface into it permanently. Until then,
+           and if either never arrives, the PNG stays */
         var tries = 0;
+        var fontsDone = false;
+        if (document.fonts && document.fonts.ready){
+          try { document.fonts.load("600 72px 'IBM Plex Mono'"); } catch (e) {}
+          document.fonts.ready.then(function(){ fontsDone = true; });
+          setTimeout(function(){ fontsDone = true; }, 1500); /* never wait forever */
+        } else { fontsDone = true; }
         (function waitForThree(){
-          if (typeof THREE !== "undefined"){ start3D(); return; }
-          if (++tries > 150) return;
+          if (typeof THREE !== "undefined" && fontsDone){ start3D(); return; }
+          if (++tries > 150){ if (typeof THREE !== "undefined") start3D(); return; }
           setTimeout(waitForThree, 100);
         })();
 
@@ -2412,7 +2431,8 @@
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
         renderer.toneMappingExposure = 1.06;
         stage.appendChild(renderer.domElement);
-        if (img) img.style.display = "none";
+        /* the static photo stays on screen for now — it is only faded out
+           by revealHero() once the model has rendered several full frames */
 
         var scene = new THREE.Scene();
         var camera = new THREE.PerspectiveCamera(38, 4 / 3, 0.1, 60);
@@ -2611,7 +2631,10 @@
 
         /* ---------- orientation state: quaternion, never clamped ---------- */
         var HOME_Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.10, -0.38, 0.02));
-        spinner.quaternion.copy(HOME_Q);
+        /* the first 3D pose faces the camera straight on, like the static
+           photo it replaces; revealHero() then eases it into HOME_Q */
+        var FRONT_Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.03, 0, 0));
+        spinner.quaternion.copy(FRONT_Q);
         var AXIS_X = new THREE.Vector3(1, 0, 0);
         var AXIS_Y = new THREE.Vector3(0, 1, 0);
         var AXIS_Z = new THREE.Vector3(0, 0, -1); /* into the screen: twist axis */
@@ -2629,6 +2652,9 @@
         var pinchDist = 1, pinchAng = 0;
         var lastTap = 0;
         var resetAnim = null;
+        var revealAnim = null;
+        var userTouched = false;
+        var revealed = false, warmFrames = 0;
 
         function pairGeom(){
           var pts = Array.from(pointers.values());
@@ -2644,6 +2670,7 @@
 
         view.addEventListener("pointerdown", function(e){
           e.preventDefault();
+          userTouched = true; revealAnim = null;
           resetAnim = null;
           velYaw = 0; velPitch = 0;
           try { view.setPointerCapture(e.pointerId); } catch (err) {}
@@ -2710,6 +2737,7 @@
         view.addEventListener("dblclick", function(e){ e.preventDefault(); startReset(); });
         view.addEventListener("wheel", function(e){
           e.preventDefault();
+          userTouched = true; revealAnim = null;
           dist = clampDist(dist * (e.deltaY < 0 ? 0.9 : 1.11));
         }, { passive: false });
 
@@ -2730,6 +2758,21 @@
           new IntersectionObserver(function(entries){ visible = entries[0].isIntersecting; }, { threshold: 0.02 }).observe(view);
         }
 
+        /* handoff: the static photo has been on screen since first paint;
+           only now — library in, font in, several full frames rendered —
+           crossfade to the live model (CSS .hp-live) and ease it from the
+           front-facing pose to the home pose, so nothing jumps */
+        function revealHero(){
+          revealed = true;
+          view.classList.add("hp-live");
+          if (!userTouched && !reduceMotion){
+            revealAnim = { t: 0, fromQ: spinner.quaternion.clone() };
+          } else if (!userTouched){
+            spinner.quaternion.copy(HOME_Q);
+          }
+          setTimeout(function(){ if (img) img.style.display = "none"; }, reduceMotion ? 60 : 820);
+        }
+
         var lastNow = performance.now();
         var elapsed = 0;
         function tick(){
@@ -2740,13 +2783,19 @@
           lastNow = nowMs;
           elapsed += dt;
           var t = elapsed;
+          if (revealAnim){
+            revealAnim.t += dt / 0.9;
+            var rk = revealAnim.t >= 1 ? 1 : (revealAnim.t < 0.5 ? 2 * revealAnim.t * revealAnim.t : 1 - Math.pow(-2 * revealAnim.t + 2, 2) / 2);
+            spinner.quaternion.slerpQuaternions(revealAnim.fromQ, HOME_Q, rk);
+            if (revealAnim.t >= 1) revealAnim = null;
+          }
           if (resetAnim){
             resetAnim.t += dt / 0.45;
             var k = resetAnim.t >= 1 ? 1 : (1 - Math.pow(1 - resetAnim.t, 3));
             spinner.quaternion.slerpQuaternions(resetAnim.fromQ, HOME_Q, k);
             dist = resetAnim.fromDist + (DIST_HOME - resetAnim.fromDist) * k;
             if (resetAnim.t >= 1) resetAnim = null;
-          } else if (pointers.size === 0 && !reduceMotion){
+          } else if (!revealAnim && pointers.size === 0 && !reduceMotion){
             /* inertia: keep spinning with the release velocity, decaying */
             if (Math.abs(velYaw) > 0.00002 || Math.abs(velPitch) > 0.00002){
               spin(AXIS_Y, velYaw * dt * 1000);
@@ -2759,6 +2808,7 @@
           camera.position.set(0, 0.12, dist);
           camera.lookAt(0, 0, 0);
           renderer.render(scene, camera);
+          if (!revealed && ++warmFrames >= 6) revealHero();
         }
         tick();
         }
